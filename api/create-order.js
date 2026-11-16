@@ -120,8 +120,18 @@ function toProductGid(productId) {
 // (External Vercel proxy — unrelated to Shopify's API, stays REST.)
 // Never sell at a stale/hardcoded rate: if live rates are unavailable, or the
 // proxy itself is serving its fallback, this throws and the order is refused.
+// Calls this same deployment's /api/gold-rates. Vercel sets
+// VERCEL_PROJECT_PRODUCTION_URL automatically, so no address is hardcoded.
+// GOLD_RATES_URL can override it if ever needed.
+function goldRatesUrl() {
+  if (process.env.GOLD_RATES_URL) return process.env.GOLD_RATES_URL;
+  const host = process.env.VERCEL_PROJECT_PRODUCTION_URL || process.env.VERCEL_URL;
+  if (!host) throw new GoldRateUnavailable('Cannot determine gold-rates URL');
+  return `https://${host}/api/gold-rates`;
+}
+
 async function getGoldRates() {
-  const res = await fetch('https://orsia-jewels.vercel.app/api/gold-rates', {
+  const res = await fetch(goldRatesUrl(), {
     headers: { 'Accept': 'application/json' }
   });
   const data = await res.json();

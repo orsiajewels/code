@@ -49,7 +49,7 @@ Secure serverless function that:
 ### Step 4 — Update your Shopify liquid file
 
 Replace `YOUR-APP.vercel.app` in the liquid file with your actual Vercel URL.
-Your Vercel URL looks like: `orsia-price-calculator.vercel.app`
+Your Vercel URL is shown on the project's Overview page in Vercel.
 
 The fetch call in your liquid file should be:
 ```
