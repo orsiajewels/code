@@ -31,7 +31,44 @@ function getGoldWeight(base18k, purityKt) {
   return r2(base24k * factor);
 }
 
+// ── Basic abuse protection (best-effort, per serverless instance) ───────────
+const RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+const RATE_LIMIT_MAX       = 10;             // draft orders per IP per window
+const MAX_TEXT_LEN         = 100;            // engraving / free-text fields
+const rateBuckets = new Map();
+
+function isRateLimited(ip) {
+  const now = Date.now();
+  const hits = (rateBuckets.get(ip) || []).filter(t => now - t < RATE_LIMIT_WINDOW_MS);
+  hits.push(now);
+  rateBuckets.set(ip, hits);
+  if (rateBuckets.size > 5000) rateBuckets.clear(); // keep memory bounded
+  return hits.length > RATE_LIMIT_MAX;
+}
+
+function cleanText(v) {
+  if (v === undefined || v === null) return '';
+  return String(v).trim().slice(0, MAX_TEXT_LEN);
+}
+
+function parseList(raw) {
+  if (!raw) return [];
+  try {
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) {
+    const n = parseFloat(raw);
+    return n > 0 ? [n] : [];
+  }
+}
+
+// Access tokens from client_credentials last ~24h — reuse instead of
+// requesting a new one on every order.
+let cachedToken = null;
+let tokenExpiresAt = 0;
+
 async function getAccessToken() {
+  if (cachedToken && Date.now() < tokenExpiresAt) return cachedToken;
   const res = await fetch(
     `https://${process.env.SHOPIFY_STORE}/admin/oauth/access_token`,
     {
@@ -46,7 +83,10 @@ async function getAccessToken() {
   );
   const data = await res.json();
   if (!data.access_token) throw new Error('Failed to get access token');
-  return data.access_token;
+  cachedToken = data.access_token;
+  const ttlSec = parseInt(data.expires_in, 10) || 3600;
+  tokenExpiresAt = Date.now() + Math.max(ttlSec - 300, 60) * 1000; // refresh 5 min early
+  return cachedToken;
 }
 
 // ── Shared GraphQL helper ────────────────────────────────────────────────
@@ -78,22 +118,24 @@ function toProductGid(productId) {
 
 // ── Live gold rate fetch — returns per-karat rates directly from proxy ────────
 // (External Vercel proxy — unrelated to Shopify's API, stays REST.)
+// Never sell at a stale/hardcoded rate: if live rates are unavailable, or the
+// proxy itself is serving its fallback, this throws and the order is refused.
 async function getGoldRates() {
-  try {
-    const res = await fetch('https://orsia-jewels.vercel.app/api/gold-rates', {
-      headers: { 'Accept': 'application/json' }
-    });
-    const data = await res.json();
-    if (data.rate18k && data.rate18k > 1000) {
-      console.log('Gold rates from proxy:', data);
-      return { 18: data.rate18k, 14: data.rate14k, 9: data.rate9k };
-    }
-    throw new Error('Invalid rates from proxy');
-  } catch(err) {
-    console.warn('Gold rate proxy failed:', err.message);
-    return { 18: 11320, 14: 8884, 9: 5732 };
+  const res = await fetch('https://orsia-jewels.vercel.app/api/gold-rates', {
+    headers: { 'Accept': 'application/json' }
+  });
+  const data = await res.json();
+  if (data.fallback) {
+    throw new GoldRateUnavailable('Proxy is serving fallback rates: ' + (data.error || 'unknown'));
   }
+  if (!(data.rate18k > 1000 && data.rate14k > 1000 && data.rate9k > 1000)) {
+    throw new GoldRateUnavailable('Invalid rates from proxy');
+  }
+  return { 18: data.rate18k, 14: data.rate14k, 9: data.rate9k };
 }
+
+class GoldRateUnavailable extends Error {}
+class PricingError extends Error {}
 
 // ── Product metafields via GraphQL ──────────────────────────────────────
 async function getProductMetafields(productId, token) {
@@ -178,7 +220,11 @@ function calcDiamondGroupPrice(matrix, quality, totalWt, count) {
     const ctMaxR = r2(r.ctMax);
     return r.quality === quality && perCt >= ctMinR && perCt <= ctMaxR;
   });
-  if (!row) return 0;
+  if (!row) {
+    // Never price diamonds at 0 — an unknown quality or an unmatched CT bucket
+    // must stop the order, not give the stones away.
+    throw new PricingError(`No diamond price for quality "${quality}" at ${perCt}ct per stone`);
+  }
   return row.price * totalWt;
 }
 
@@ -222,17 +268,33 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST')   return res.status(405).json({ error: 'Method not allowed' });
 
+  // Browsers always send Origin on cross-site POSTs — reject other sites.
+  const origin = req.headers.origin;
+  if (origin && origin !== allowedOrigin && origin !== `https://www.${rawDomain}`) {
+    return res.status(403).json({ error: 'Origin not allowed' });
+  }
+
+  const ip = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() || 'unknown';
+  if (isRateLimited(ip)) {
+    return res.status(429).json({ error: 'Too many requests, please try again in a few minutes' });
+  }
+
   try {
     const {
       productId, productTitle,
       purityKt, metalLabel, quality, diamondType,
-      solWt, sideWt,
+      // solWt / sideWt may still be sent by the front-end but are IGNORED —
+      // diamond weights are read from product metafields by ctIndex.
       ctIndex,                  // ← index of selected CT option (0-based), sent by front-end
-      shape, ringSize, certType, engravingText
-    } = req.body;
+      shape, ringSize, certType
+    } = req.body || {};
+    const engravingText = cleanText((req.body || {}).engravingText);
 
     if (!productId || !productTitle || !purityKt || !quality || !diamondType) {
       return res.status(400).json({ error: 'Missing required fields' });
+    }
+    if (!/^(gid:\/\/shopify\/Product\/)?\d+$/.test(String(productId))) {
+      return res.status(400).json({ error: 'Invalid product' });
     }
     const purityInt = parseInt(purityKt, 10);
     if (!VALID_PURITIES.includes(purityInt)) {
@@ -243,12 +305,11 @@ export default async function handler(req, res) {
     }
 
     const ctIdx = parseInt(ctIndex, 10) || 0;
+    if (ctIdx < 0) return res.status(400).json({ error: 'Invalid CT option' });
 
-    console.log('SHOPIFY_STORE:', process.env.SHOPIFY_STORE);
     const token = await getAccessToken();
 
     const meta = await getProductMetafields(productId, token);
-    console.log('ALL metafields:', JSON.stringify(meta));
 
     // ── Read the 18K gold weight options list ──────────────────────────────
     // Metafield: custom.gold_weight_18kt_options  (type: list.number_decimal)
@@ -258,28 +319,30 @@ export default async function handler(req, res) {
       || meta['custom.gold_weight_18kt_options']
       || '[]';
 
-    let goldWt18kOptions = [];
-    try {
-      goldWt18kOptions = JSON.parse(goldWt18kOptionsRaw);
-    } catch(e) {
-      const n = parseFloat(goldWt18kOptionsRaw);
-      if (n > 0) goldWt18kOptions = [n];
-    }
+    const goldWt18kOptions = parseList(goldWt18kOptionsRaw);
 
     const base18k = parseFloat(goldWt18kOptions[ctIdx]) || 0;
 
     if (!base18k) {
-      return res.status(400).json({
-        error: 'Gold weight not configured for this CT option',
-        debug: { ctIdx, goldWt18kOptions, debug_keys: Object.keys(meta) }
-      });
+      console.warn('Gold weight not configured', { productId, ctIdx });
+      return res.status(400).json({ error: 'This option is not available for this product' });
     }
 
     const solCount  = parseInt(meta.solitaire_count  || meta['custom.solitaire_count']  || 0, 10);
     const sideCount = parseInt(meta.side_count        || meta['custom.side_count']        || 0, 10);
 
-    const solWtFloat  = parseFloat(solWt)  || 0;
-    const sideWtFloat = parseFloat(sideWt) || 0;
+    // Diamond weights come from the product, never from the browser.
+    // Metafields: custom.solitaire_ct_options / custom.side_ct_options
+    // (list.number_decimal, same order as gold_weight_18kt_options)
+    const solOptions  = parseList(meta.solitaire_ct_options || meta['custom.solitaire_ct_options']);
+    const sideOptions = parseList(meta.side_ct_options      || meta['custom.side_ct_options']);
+    const solWtFloat  = parseFloat(solOptions[ctIdx])  || 0;
+    const sideWtFloat = parseFloat(sideOptions[ctIdx]) || 0;
+
+    if (solWtFloat <= 0 && sideWtFloat <= 0) {
+      console.warn('Diamond weights not configured', { productId, ctIdx });
+      return res.status(400).json({ error: 'This option is not available for this product' });
+    }
     const totalCt     = +(solWtFloat + sideWtFloat).toFixed(3);
 
     // ── Gold weight and rate for the selected purity ───────────────────────
@@ -322,9 +385,9 @@ export default async function handler(req, res) {
       ...(solWtFloat  > 0 ? [{ key: 'Solitaire Weight',    value: solWtFloat + 'ct' }] : []),
       ...(sideWtFloat > 0 ? [{ key: 'Side Diamond Count',  value: sideCount + ' pcs' }] : []),
       ...(sideWtFloat > 0 ? [{ key: 'Side Diamond Weight', value: sideWtFloat + 'ct' }] : []),
-      ...(ringSize      ? [{ key: 'Ring Size',       value: ringSize      }] : []),
-      ...(shape         ? [{ key: 'Diamond Shape',   value: shape         }] : []),
-      ...(certType      ? [{ key: 'Certificate',     value: certType      }] : []),
+      ...(ringSize      ? [{ key: 'Ring Size',       value: cleanText(ringSize) }] : []),
+      ...(shape         ? [{ key: 'Diamond Shape',   value: cleanText(shape)    }] : []),
+      ...(certType      ? [{ key: 'Certificate',     value: cleanText(certType) }] : []),
       ...(engravingText ? [{ key: 'Engraving Text',  value: engravingText }] : [])
     ];
 
@@ -382,7 +445,15 @@ export default async function handler(req, res) {
     });
 
   } catch(err) {
+    if (err instanceof GoldRateUnavailable) {
+      console.error('Order refused — live gold rate unavailable:', err.message);
+      return res.status(503).json({ error: 'Live gold rates are temporarily unavailable. Please try again shortly.' });
+    }
+    if (err instanceof PricingError) {
+      console.error('Order refused — pricing error:', err.message);
+      return res.status(400).json({ error: 'This combination is not available. Please choose a different option.' });
+    }
     console.error('Orsia order error:', err);
-    return res.status(500).json({ error: 'Internal server error', message: err.message });
+    return res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 }

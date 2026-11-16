@@ -97,7 +97,10 @@ export default async function handler(req, res) {
   } catch(err) {
     console.warn('GPE fetch failed:', err.message);
 
-    // Fallback: derive all rates from the hardcoded 24K base
+    // Don't let the CDN cache a fallback response for 5 minutes.
+    res.setHeader('Cache-Control', 'no-store');
+
+    // Fallback (display only — create-order refuses to sell when fallback:true): derive all rates from the hardcoded 24K base
     return res.status(200).json({
       rate24k:  FALLBACK_24K,
       rate18k:  Math.round(FALLBACK_24K * KARAT_FACTORS[18]),  // 11,320

@@ -11,17 +11,12 @@ Secure serverless function that:
 
 ## Setup Instructions
 
-### Step 1 — Create Shopify Private App Token
+### Step 1 — Create a Shopify app (client credentials)
 
-1. Shopify Admin → Settings → Apps → Develop apps
-2. Click "Create an app" → name it "Orsia Price Calculator"
-3. Go to Configuration → Admin API scopes → enable:
-   - `read_products`
-   - `write_draft_orders`
-   - `read_metafields`
-4. Click Save → Install app
-5. Copy the "Admin API access token" (starts with shpat_)
-   ⚠️ You only see this once — copy it immediately
+1. Shopify Admin → Settings → Apps → Develop apps → create an app ("Orsia Price Calculator")
+2. Admin API scopes: `read_products`, `write_draft_orders`, `read_metaobjects`, `read_metafields`
+3. Install the app and copy its **Client ID** and **Client secret**.
+   The functions exchange these for a short-lived access token automatically.
 
 ### Step 2 — Deploy to Vercel
 
@@ -39,13 +34,15 @@ Secure serverless function that:
 ### Step 3 — Add Environment Variables in Vercel
 
 1. Go to vercel.com → your project → Settings → Environment Variables
-2. Add these three variables:
+2. Add these variables (see `.env.example`):
 
    | Name | Value |
    |------|-------|
    | SHOPIFY_STORE | your-store.myshopify.com |
-   | SHOPIFY_STORE_DOMAIN | your-actual-domain.com |
-   | SHOPIFY_TOKEN | shpat_xxxxxxxxxx |
+   | SHOPIFY_STORE_DOMAIN | orsiajewels.com |
+   | SHOPIFY_CLIENT_ID | from Step 1 |
+   | SHOPIFY_CLIENT_SECRET | from Step 1 |
+   | SHOP_CURRENCY_CODE | INR (optional) |
 
 3. After adding, go to Deployments → Redeploy
 
@@ -74,7 +71,8 @@ https://orsia-price-calculator.vercel.app/api/create-order
 ```
 orsia-vercel/
 ├── api/
-│   └── create-order.js   ← Main function (all logic lives here)
+│   ├── create-order.js   ← Price calculation + draft order
+│   └── gold-rates.js     ← Live gold rate proxy (GPE metafield)
 ├── .env.example          ← Template for environment variables
 ├── .gitignore            ← Prevents .env from being committed
 ├── package.json          ← Project config
@@ -102,8 +100,10 @@ and change the value. Then redeploy.
 
 ## Security
 
-- Browser never sends the price — only selections (purity, CT, quality)
-- All calculation happens server-side on Vercel
-- Shopify token never exposed to browser
-- CORS restricted to your store domain only
-- All inputs validated before processing
+- Browser sends only selections (product, purity, CT option index, quality, type).
+  Gold weight **and diamond weights** are read from product metafields
+  (`gold_weight_18kt_options`, `solitaire_ct_options`, `side_ct_options`) by CT index.
+- An unknown quality / unmatched CT bucket refuses the order (never prices diamonds at 0).
+- If live gold rates are unavailable, orders are refused (HTTP 503) instead of using stale fallback rates.
+- Requests from other website origins are rejected; each IP is limited to 10 orders per 10 minutes (best-effort, per instance).
+- Shopify credentials never reach the browser; error responses don't expose internal details.
