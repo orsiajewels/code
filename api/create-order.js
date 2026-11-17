@@ -35,6 +35,8 @@ function getGoldWeight(base18k, purityKt) {
 const RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 const RATE_LIMIT_MAX       = 10;             // draft orders per IP per window
 const MAX_TEXT_LEN         = 100;            // engraving / free-text fields
+const MAX_LINES            = 10;             // different products per checkout
+const MAX_QTY_PER_LINE     = 20;             // pieces of one configuration
 const rateBuckets = new Map();
 
 function isRateLimited(ip) {
@@ -146,6 +148,7 @@ async function getGoldRates() {
 
 class GoldRateUnavailable extends Error {}
 class PricingError extends Error {}
+class InputError extends Error {}
 
 // ── Product metafields via GraphQL ──────────────────────────────────────
 async function getProductMetafields(productId, token) {
@@ -239,7 +242,7 @@ function calcDiamondGroupPrice(matrix, quality, totalWt, count) {
 }
 
 // ── Draft order creation via GraphQL ────────────────────────────────────
-async function createDraftOrderGraphQL(lineItem, note, token) {
+async function createDraftOrderGraphQL(lineItems, note, token) {
   const query = `
     mutation CreateDraftOrder($input: DraftOrderInput!) {
       draftOrderCreate(input: $input) {
@@ -256,7 +259,7 @@ async function createDraftOrderGraphQL(lineItem, note, token) {
   `;
   const data = await shopifyGraphQL(
     query,
-    { input: { lineItems: [lineItem], note } },
+    { input: { lineItems, note } },
     token
   );
 
@@ -266,6 +269,140 @@ async function createDraftOrderGraphQL(lineItem, note, token) {
     throw new Error(result.userErrors.map(e => e.message).join('; '));
   }
   return result.draftOrder;
+}
+
+// ── Price one line (one product configuration × quantity) ─────────────────
+// All prices are computed here from Shopify data; the browser only sends
+// choices (product, purity, CT option index, quality, type, quantity).
+async function priceLine(item, { token, goldRates, getMatrix }) {
+  const {
+    productId, productTitle,
+    purityKt, metalLabel, quality, diamondType,
+    // solWt / sideWt may still be sent by the front-end but are IGNORED —
+    // diamond weights are read from product metafields by ctIndex.
+    ctIndex, shape, ringSize, certType
+  } = item;
+  const engravingText = cleanText(item.engravingText);
+
+  if (!productId || !productTitle || !purityKt || !quality || !diamondType) {
+    throw new InputError('Missing required fields');
+  }
+  if (!/^(gid:\/\/shopify\/Product\/)?\d+$/.test(String(productId))) {
+    throw new InputError('Invalid product');
+  }
+  const purityInt = parseInt(purityKt, 10);
+  if (!VALID_PURITIES.includes(purityInt)) throw new InputError('Invalid purity');
+  if (!['lab', 'natural'].includes(diamondType)) throw new InputError('Invalid diamond type');
+
+  const ctIdx = parseInt(ctIndex, 10) || 0;
+  if (ctIdx < 0) throw new InputError('Invalid CT option');
+
+  const quantity = (item.quantity === undefined || item.quantity === null || item.quantity === '')
+    ? 1 : Number(item.quantity);
+  if (!Number.isInteger(quantity) || quantity < 1 || quantity > MAX_QTY_PER_LINE) {
+    throw new InputError(`Quantity must be between 1 and ${MAX_QTY_PER_LINE}`);
+  }
+
+  const meta = await getProductMetafields(productId, token);
+
+  // ── 18K gold weight for this CT option ──────────────────────────────────
+  // Metafield: custom.gold_weight_18kt_options  (type: list.number_decimal)
+  // Code derives: 24K = 18K ÷ 0.79, then 14K = 24K × 0.62, 9K = 24K × 0.40
+  const goldWt18kOptions = parseList(meta.gold_weight_18kt_options || meta['custom.gold_weight_18kt_options']);
+  const base18k = parseFloat(goldWt18kOptions[ctIdx]) || 0;
+  if (!base18k) {
+    console.warn('Gold weight not configured', { productId, ctIdx });
+    throw new InputError('This option is not available for this product');
+  }
+
+  const solCount  = parseInt(meta.solitaire_count || meta['custom.solitaire_count'] || 0, 10);
+  const sideCount = parseInt(meta.side_count      || meta['custom.side_count']      || 0, 10);
+
+  // Diamond weights come from the product, never from the browser.
+  // Metafields: custom.solitaire_ct_options / custom.side_ct_options
+  const solOptions  = parseList(meta.solitaire_ct_options || meta['custom.solitaire_ct_options']);
+  const sideOptions = parseList(meta.side_ct_options      || meta['custom.side_ct_options']);
+  const solWtFloat  = parseFloat(solOptions[ctIdx])  || 0;
+  const sideWtFloat = parseFloat(sideOptions[ctIdx]) || 0;
+  if (solWtFloat <= 0 && sideWtFloat <= 0) {
+    console.warn('Diamond weights not configured', { productId, ctIdx });
+    throw new InputError('This option is not available for this product');
+  }
+  const totalCt = +(solWtFloat + sideWtFloat).toFixed(3);
+
+  const goldWt    = getGoldWeight(base18k, purityInt);   // derives 24K then scales to karat
+  const goldPrice = goldWt * goldRates[purityInt];
+
+  const matrix    = await getMatrix(diamondType);
+  const solPrice  = calcDiamondGroupPrice(matrix, quality, solWtFloat,  solCount);
+  const sidePrice = calcDiamondGroupPrice(matrix, quality, sideWtFloat, sideCount);
+
+  const making    = MAKING_CHARGE_PER_GRAM * goldWt;
+  const subtotal  = goldPrice + solPrice + sidePrice + making;
+  const certPrice = certType ? 1000 : 0;
+  // GST is not added here — Shopify's tax settings apply it on the draft
+  // order based on the customer's address, so this price is tax-exclusive.
+  const unitPrice = Math.round(subtotal) + certPrice;
+
+  console.log('Price calc:', {
+    productId, quantity, base18k, goldWt, goldRate: goldRates[purityInt],
+    goldPrice, solPrice, sidePrice, making, unitPrice
+  });
+
+  const colorMatch       = (metalLabel || '').match(/Yellow|White|Rose/i);
+  const colorName        = colorMatch ? colorMatch[0] : 'Yellow';
+  const diamondTypeLabel = diamondType === 'lab' ? 'Lab Grown Diamond' : 'Natural Diamond';
+
+  const customAttributes = [
+    { key: 'Gold Purity',     value: purityInt + 'kt'        },
+    { key: 'Metal Color',     value: colorName               },
+    { key: 'Gold Weight',     value: goldWt.toFixed(3) + 'g' },
+    { key: 'Diamond Type',    value: diamondTypeLabel        },
+    { key: 'Diamond Quality', value: cleanText(quality)      },
+    { key: 'Total CT',        value: totalCt + 'ct'          },
+    ...(solWtFloat  > 0 ? [{ key: 'Solitaire Count',     value: solCount + ' pcs' }] : []),
+    ...(solWtFloat  > 0 ? [{ key: 'Solitaire Weight',    value: solWtFloat + 'ct' }] : []),
+    ...(sideWtFloat > 0 ? [{ key: 'Side Diamond Count',  value: sideCount + ' pcs' }] : []),
+    ...(sideWtFloat > 0 ? [{ key: 'Side Diamond Weight', value: sideWtFloat + 'ct' }] : []),
+    ...(ringSize      ? [{ key: 'Ring Size',      value: cleanText(ringSize) }] : []),
+    ...(shape         ? [{ key: 'Diamond Shape',  value: cleanText(shape)    }] : []),
+    ...(certType      ? [{ key: 'Certificate',    value: cleanText(certType) }] : []),
+    ...(engravingText ? [{ key: 'Engraving Text', value: engravingText       }] : [])
+  ];
+
+  // Attach a real variant so checkout shows the product image; priceOverride
+  // (GraphQL 2025-01+) sets the per-unit price. Shopify multiplies by quantity.
+  const variant = await getVariantForPrice(productId, token);
+  const lineItem = variant
+    ? {
+        variantId: variant.id,
+        quantity,
+        priceOverride: { amount: unitPrice.toFixed(2), currencyCode: CURRENCY_CODE },
+        customAttributes
+      }
+    : {
+        // No variant found — fall back to a custom line item (no image).
+        title: cleanText(productTitle),
+        quantity,
+        originalUnitPriceWithCurrency: { amount: unitPrice.toFixed(2), currencyCode: CURRENCY_CODE },
+        requiresShipping: true,
+        customAttributes
+      };
+
+  return {
+    lineItem, unitPrice, quantity,
+    note: `Orsia — ${purityInt}kt / ${totalCt}ct / ${cleanText(quality)} / ${diamondType}`,
+    breakdown: {
+      goldWeight18k:    base18k,
+      goldWeightActual: goldWt,
+      goldRate:         goldRates[purityInt],
+      goldPrice:        Math.round(goldPrice),
+      solPrice:         Math.round(solPrice),
+      sidePrice:        Math.round(sidePrice),
+      making:           Math.round(making),
+      total:            unitPrice
+    }
+  };
 }
 
 export default async function handler(req, res) {
@@ -290,174 +427,54 @@ export default async function handler(req, res) {
   }
 
   try {
-    const {
-      productId, productTitle,
-      purityKt, metalLabel, quality, diamondType,
-      // solWt / sideWt may still be sent by the front-end but are IGNORED —
-      // diamond weights are read from product metafields by ctIndex.
-      ctIndex,                  // ← index of selected CT option (0-based), sent by front-end
-      shape, ringSize, certType
-    } = req.body || {};
-    const engravingText = cleanText((req.body || {}).engravingText);
+    const body = req.body || {};
 
-    if (!productId || !productTitle || !purityKt || !quality || !diamondType) {
-      return res.status(400).json({ error: 'Missing required fields' });
-    }
-    if (!/^(gid:\/\/shopify\/Product\/)?\d+$/.test(String(productId))) {
-      return res.status(400).json({ error: 'Invalid product' });
-    }
-    const purityInt = parseInt(purityKt, 10);
-    if (!VALID_PURITIES.includes(purityInt)) {
-      return res.status(400).json({ error: 'Invalid purity' });
-    }
-    if (!['lab', 'natural'].includes(diamondType)) {
-      return res.status(400).json({ error: 'Invalid diamond type' });
+    // The product page sends one item at the top level. The cart drawer sends
+    // one item with `quantity`, or { items: [...] } for several products.
+    const rawItems = Array.isArray(body.items) ? body.items : [body];
+    if (rawItems.length === 0 || rawItems.length > MAX_LINES) {
+      throw new InputError(`You can check out up to ${MAX_LINES} different items at once`);
     }
 
-    const ctIdx = parseInt(ctIndex, 10) || 0;
-    if (ctIdx < 0) return res.status(400).json({ error: 'Invalid CT option' });
+    const token     = await getAccessToken();
+    const goldRates = await getGoldRates();   // one live rate for the whole order
+    const matrixCache = {};
+    const getMatrix = (type) =>
+      (matrixCache[type] = matrixCache[type] || getDiamondMatrix(type, token));
 
-    const token = await getAccessToken();
-
-    const meta = await getProductMetafields(productId, token);
-
-    // ── Read the 18K gold weight options list ──────────────────────────────
-    // Metafield: custom.gold_weight_18kt_options  (type: list.number_decimal)
-    // Admin enters 18K gross weights in grams, one per solitaire_ct_options entry.
-    // Code derives: 24K = 18K ÷ 0.79, then 14K = 24K × 0.62, 9K = 24K × 0.40
-    const goldWt18kOptionsRaw = meta.gold_weight_18kt_options
-      || meta['custom.gold_weight_18kt_options']
-      || '[]';
-
-    const goldWt18kOptions = parseList(goldWt18kOptionsRaw);
-
-    const base18k = parseFloat(goldWt18kOptions[ctIdx]) || 0;
-
-    if (!base18k) {
-      console.warn('Gold weight not configured', { productId, ctIdx });
-      return res.status(400).json({ error: 'This option is not available for this product' });
+    const lines = [];
+    for (const raw of rawItems) {
+      lines.push(await priceLine(raw || {}, { token, goldRates, getMatrix }));
     }
 
-    const solCount  = parseInt(meta.solitaire_count  || meta['custom.solitaire_count']  || 0, 10);
-    const sideCount = parseInt(meta.side_count        || meta['custom.side_count']        || 0, 10);
+    const lineItems  = lines.map(l => l.lineItem);
+    const orderTotal = lines.reduce((sum, l) => sum + l.unitPrice * l.quantity, 0);
+    const note = lines.length === 1
+      ? lines[0].note + (lines[0].quantity > 1 ? ` x ${lines[0].quantity}` : '')
+      : `Orsia — ${lines.length} items: ` + lines.map(l => `${l.note} x ${l.quantity}`).join(' | ');
 
-    // Diamond weights come from the product, never from the browser.
-    // Metafields: custom.solitaire_ct_options / custom.side_ct_options
-    // (list.number_decimal, same order as gold_weight_18kt_options)
-    const solOptions  = parseList(meta.solitaire_ct_options || meta['custom.solitaire_ct_options']);
-    const sideOptions = parseList(meta.side_ct_options      || meta['custom.side_ct_options']);
-    const solWtFloat  = parseFloat(solOptions[ctIdx])  || 0;
-    const sideWtFloat = parseFloat(sideOptions[ctIdx]) || 0;
-
-    if (solWtFloat <= 0 && sideWtFloat <= 0) {
-      console.warn('Diamond weights not configured', { productId, ctIdx });
-      return res.status(400).json({ error: 'This option is not available for this product' });
-    }
-    const totalCt     = +(solWtFloat + sideWtFloat).toFixed(3);
-
-    // ── Gold weight and rate for the selected purity ───────────────────────
-    const goldRates = await getGoldRates();
-    const goldWt    = getGoldWeight(base18k, purityInt);   // derives 24K then scales to karat
-    const goldPrice = goldWt * goldRates[purityInt];
-
-    const matrix    = await getDiamondMatrix(diamondType, token);
-    const solPrice  = calcDiamondGroupPrice(matrix, quality, solWtFloat,  solCount);
-    const sidePrice = calcDiamondGroupPrice(matrix, quality, sideWtFloat, sideCount);
-
-    const making   = MAKING_CHARGE_PER_GRAM * goldWt;
-    const subtotal = goldPrice + solPrice + sidePrice + making;
-    const certPrice = certType ? 1000 : 0;
-    // GST is no longer added here — Shopify's own tax settings (Settings →
-    // Taxes and duties) apply GST automatically on the draft order based on
-    // the customer's address, so the price sent to Shopify is tax-exclusive.
-    const total    = Math.round(subtotal) + certPrice;
-
-    console.log('Price calc:', {
-      base18k, goldWt, goldRate: goldRates[purityInt],
-      goldPrice, solPrice, sidePrice, making, total
-    });
-
-    // ── Friendly display values for order properties ───────────────────────
-    // metalLabel arrives as the full label (e.g. "18K Yellow Gold") — pull
-    // just the color word out of it for the "Metal Color" property.
-    const colorMatch  = (metalLabel || '').match(/Yellow|White|Rose/i);
-    const colorName   = colorMatch ? colorMatch[0] : 'Yellow';
-    const diamondTypeLabel = diamondType === 'lab' ? 'Lab Grown Diamond' : 'Natural Diamond';
-
-    const commonAttributes = [
-      { key: 'Gold Purity',         value: purityInt + 'kt'              },
-      { key: 'Metal Color',         value: colorName                     },
-      { key: 'Gold Weight',         value: goldWt.toFixed(3) + 'g'      },
-      { key: 'Diamond Type',        value: diamondTypeLabel              },
-      { key: 'Diamond Quality',     value: quality                       },
-      { key: 'Total CT',            value: totalCt + 'ct'               },
-      ...(solWtFloat  > 0 ? [{ key: 'Solitaire Count',     value: solCount + ' pcs' }] : []),
-      ...(solWtFloat  > 0 ? [{ key: 'Solitaire Weight',    value: solWtFloat + 'ct' }] : []),
-      ...(sideWtFloat > 0 ? [{ key: 'Side Diamond Count',  value: sideCount + ' pcs' }] : []),
-      ...(sideWtFloat > 0 ? [{ key: 'Side Diamond Weight', value: sideWtFloat + 'ct' }] : []),
-      ...(ringSize      ? [{ key: 'Ring Size',       value: cleanText(ringSize) }] : []),
-      ...(shape         ? [{ key: 'Diamond Shape',   value: cleanText(shape)    }] : []),
-      ...(certType      ? [{ key: 'Certificate',     value: cleanText(certType) }] : []),
-      ...(engravingText ? [{ key: 'Engraving Text',  value: engravingText }] : [])
-    ];
-
-    // ── Attach a real variant so checkout shows the product image ──────────
-    // priceOverride works only on GraphQL (2025-01+) with a variantId set —
-    // REST's draft_orders.json ignores a custom `price` when variant_id is
-    // present, which is why this order-creation flow moved to GraphQL.
-    const variant = await getVariantForPrice(productId, token);
-
-    let lineItem;
-    if (variant) {
-      lineItem = {
-        variantId: variant.id,
-        quantity: 1,
-        priceOverride: {
-          amount: total.toFixed(2),
-          currencyCode: CURRENCY_CODE
-        },
-        customAttributes: commonAttributes
-      };
-    } else {
-      // No variant found — fall back to a custom line item (no image).
-      lineItem = {
-        title: productTitle,
-        quantity: 1,
-        originalUnitPriceWithCurrency: {
-          amount: total.toFixed(2),
-          currencyCode: CURRENCY_CODE
-        },
-        requiresShipping: true,
-        customAttributes: commonAttributes
-      };
-    }
-
-    const note = `Orsia — ${purityInt}kt / ${totalCt}ct / ${quality} / ${diamondType}`;
-    const draftOrder = await createDraftOrderGraphQL(lineItem, note, token);
-
+    const draftOrder = await createDraftOrderGraphQL(lineItems, note, token);
     if (!draftOrder) {
       return res.status(500).json({ error: 'Failed to create order' });
     }
 
-    return res.status(200).json({
-      checkoutUrl:     draftOrder.invoiceUrl,
-      calculatedPrice: total,
-      breakdown: {
-        goldWeight18k:   base18k,
-        goldWeightActual: goldWt,
-        goldRate:      goldRates[purityInt],
-        goldPrice:     Math.round(goldPrice),
-        solPrice:      Math.round(solPrice),
-        sidePrice:     Math.round(sidePrice),
-        making:        Math.round(making),
-        total
-      }
-    });
+    const response = { checkoutUrl: draftOrder.invoiceUrl, calculatedPrice: orderTotal };
+    if (lines.length === 1) {
+      response.unitPrice = lines[0].unitPrice;
+      response.quantity  = lines[0].quantity;
+      response.breakdown = lines[0].breakdown;
+    } else {
+      response.items = lines.map(l => ({ unitPrice: l.unitPrice, quantity: l.quantity }));
+    }
+    return res.status(200).json(response);
 
   } catch(err) {
     if (err instanceof GoldRateUnavailable) {
       console.error('Order refused — live gold rate unavailable:', err.message);
       return res.status(503).json({ error: 'Live gold rates are temporarily unavailable. Please try again shortly.' });
+    }
+    if (err instanceof InputError) {
+      return res.status(400).json({ error: err.message });
     }
     if (err instanceof PricingError) {
       console.error('Order refused — pricing error:', err.message);
