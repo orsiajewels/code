@@ -229,12 +229,24 @@ function render({ shop, rates, health, matrices, productRows, productCount, gene
     </div>`;
   }).join('');
 
+  const countWith = prefix => productRows.filter(r => r.issues.some(i => i.startsWith(prefix))).length;
+  const labCount = countWith('lab:'), natCount = countWith('natural:');
+  const setupCount = productRows.filter(r => r.issues.some(i => i.startsWith('no '))).length;
+  const sortedRows = [...productRows].sort((a, b) => {
+    const rank = r => r.issues.some(i => i.startsWith('no ')) ? 0 : r.issues.some(i => i.startsWith('lab:')) ? 1 : 2;
+    return rank(a) - rank(b) || a.title.localeCompare(b.title) || a.option - b.option;
+  });
   const productCard = `<div class="card">
     <div class="row"><h2>Products that can't be priced</h2>
       <span class="pill ${productRows.length ? 'warn' : 'ok'}">${productRows.length ? productRows.length + ' option' + (productRows.length > 1 ? 's' : '') : 'All OK'}</span></div>
+    ${productRows.length ? `<div class="grid" style="margin-bottom:12px">
+      <div class="stat"><span>Missing product setup</span><b>${setupCount}</b></div>
+      <div class="stat"><span>Lab grown gaps</span><b>${labCount}</b></div>
+      <div class="stat"><span>Natural gaps</span><b>${natCount}</b></div>
+    </div>` : ''}
     <p class="muted" style="margin:0 0 10px">Checked ${productCount} active product${productCount === 1 ? '' : 's'} that use the calculator, every CT option, every quality, lab and natural. A customer choosing one of these combinations sees "This combination is not available". If you don't sell that diamond type on a product, you can ignore its line.</p>
     ${productRows.length ? `<div class="scroll"><table><thead><tr><th>Product</th><th>CT option</th><th>What's missing</th></tr></thead><tbody>
-      ${productRows.map(r => `<tr><td><a href="https://${esc(shop)}/products/${esc(r.handle)}" target="_blank" rel="noopener">${esc(r.title)}</a></td><td>#${r.option} · ${r.ct} ct</td><td><ul>${r.issues.map(i => `<li>${esc(i)}</li>`).join('')}</ul></td></tr>`).join('')}
+      ${sortedRows.map(r => `<tr><td><a href="https://${esc(shop)}/products/${esc(r.handle)}" target="_blank" rel="noopener">${esc(r.title)}</a></td><td>#${r.option} · ${r.ct} ct</td><td><ul>${r.issues.map(i => `<li>${esc(i)}</li>`).join('')}</ul></td></tr>`).join('')}
     </tbody></table></div>` : ''}
   </div>`;
 
