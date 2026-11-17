@@ -87,7 +87,7 @@ async function getProducts(token) {
   for (let page = 0; page < 5; page++) {           // up to 500 products
     const d = await gql(`query($after: String) { products(first: 100, after: $after, query: "status:active") {
         pageInfo { hasNextPage endCursor }
-        edges { node { id title handle metafields(namespace: "custom", first: 30) { edges { node { key value } } } } } } }`,
+        edges { node { id title handle metafields(namespace: "custom", first: 50) { edges { node { key value } } } } } } }`,
       { after }, token);
     for (const { node } of d.products.edges) {
       const m = {}; node.metafields.edges.forEach(({ node: f }) => { m[f.key] = f.value; });
@@ -144,12 +144,20 @@ function productProblems(products, matrices) {
     const side = parseList(p.m.side_ct_options);
     const solCount = parseInt(p.m.solitaire_count || 0, 10);
     const sideCount = parseInt(p.m.side_count || 0, 10);
+    const flag = k => String(p.m[k] ?? '').toLowerCase();
+    const offered = { lab: flag('show_lab_diamond') !== 'false', natural: flag('show_natural_diamond') === 'true' };
     for (let i = 0; i < gold.length; i++) {
       const issues = [];
       if (!(parseFloat(gold[i]) > 0)) issues.push('no 18K gold weight');
+      if ((sol.length && i >= sol.length) || (side.length && i >= side.length)) {
+        issues.push(`carat lists out of step: ${gold.length} gold weights, ${sol.length} solitaire, ${side.length} side — fix in product metafields`);
+        rows.push({ title: p.title, handle: p.handle, option: i + 1, ct: 0, issues });
+        continue;
+      }
       const sw = parseFloat(sol[i]) || 0, dw = parseFloat(side[i]) || 0;
       if (sw <= 0 && dw <= 0) issues.push('no diamond weights');
       for (const [type, { matrix, qualities }] of Object.entries(matrices)) {
+        if (!offered[type]) continue;             // product doesn't sell this type
         const missing = [];
         for (const q of qualities) {
           const groups = [[sw, solCount], [dw, sideCount]].filter(([w]) => w > 0);
@@ -229,11 +237,12 @@ function render({ shop, rates, health, matrices, productRows, productCount, gene
     </div>`;
   }).join('');
 
+  const isSetup = i => i.startsWith('no ') || i.startsWith('carat lists');
   const countWith = prefix => productRows.filter(r => r.issues.some(i => i.startsWith(prefix))).length;
   const labCount = countWith('lab:'), natCount = countWith('natural:');
-  const setupCount = productRows.filter(r => r.issues.some(i => i.startsWith('no '))).length;
+  const setupCount = productRows.filter(r => r.issues.some(isSetup)).length;
   const sortedRows = [...productRows].sort((a, b) => {
-    const rank = r => r.issues.some(i => i.startsWith('no ')) ? 0 : r.issues.some(i => i.startsWith('lab:')) ? 1 : 2;
+    const rank = r => r.issues.some(isSetup) ? 0 : r.issues.some(i => i.startsWith('lab:')) ? 1 : 2;
     return rank(a) - rank(b) || a.title.localeCompare(b.title) || a.option - b.option;
   });
   const productCard = `<div class="card">
@@ -244,7 +253,7 @@ function render({ shop, rates, health, matrices, productRows, productCount, gene
       <div class="stat"><span>Lab grown gaps</span><b>${labCount}</b></div>
       <div class="stat"><span>Natural gaps</span><b>${natCount}</b></div>
     </div>` : ''}
-    <p class="muted" style="margin:0 0 10px">Checked ${productCount} active product${productCount === 1 ? '' : 's'} that use the calculator, every CT option, every quality, lab and natural. A customer choosing one of these combinations sees "This combination is not available". If you don't sell that diamond type on a product, you can ignore its line.</p>
+    <p class="muted" style="margin:0 0 10px">Checked ${productCount} active product${productCount === 1 ? '' : 's'} that use the calculator: every CT option and every quality, for the diamond types each product offers (lab unless switched off, natural only where show_natural_diamond is on). A customer choosing one of these sees "not available" at checkout.</p>
     ${productRows.length ? `<div class="scroll"><table><thead><tr><th>Product</th><th>CT option</th><th>What's missing</th></tr></thead><tbody>
       ${sortedRows.map(r => `<tr><td><a href="https://${esc(shop)}/products/${esc(r.handle)}" target="_blank" rel="noopener">${esc(r.title)}</a></td><td>#${r.option} · ${r.ct} ct</td><td><ul>${r.issues.map(i => `<li>${esc(i)}</li>`).join('')}</ul></td></tr>`).join('')}
     </tbody></table></div>` : ''}

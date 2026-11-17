@@ -155,6 +155,7 @@ async function getProductMetafields(productId, token) {
   const query = `
     query GetProductMetafields($id: ID!) {
       product(id: $id) {
+        title
         metafields(namespace: "custom", first: 50) {
           edges {
             node { key value namespace }
@@ -170,6 +171,7 @@ async function getProductMetafields(productId, token) {
     fields[node.key] = node.value;
     fields[`${node.namespace}.${node.key}`] = node.value;
   });
+  fields.__title = data.product?.title || '';
   return fields;
 }
 
@@ -271,6 +273,27 @@ async function createDraftOrderGraphQL(lineItems, note, token) {
   return result.draftOrder;
 }
 
+// ── Diamond shape (E-01) ─────────────────────────────────────────────────────
+// Order of trust: a shape the customer picked from the product's own shape
+// selector (must be a known shape) → product metafield custom.diamond_shape →
+// the product title as stored in Shopify (not as sent by the browser).
+const KNOWN_SHAPES = ['Round','Oval','Princess','Emerald','Asscher','Cushion','Radiant','Pear','Marquise','Heart','Baguette','Trillion','Trilliant'];
+function canonicalShape(v) {
+  const t = String(v || '').trim().toLowerCase();
+  return KNOWN_SHAPES.find(k => k.toLowerCase() === t) || null;
+}
+function resolveShape(browserShape, meta) {
+  const picked = canonicalShape(browserShape);
+  if (picked) return picked;
+  const fromMeta = canonicalShape(meta.diamond_shape || meta['custom.diamond_shape']);
+  if (fromMeta) return fromMeta;
+  const title = meta.__title || '';
+  for (const k of KNOWN_SHAPES) {
+    if (new RegExp('\\b' + k + '\\b', 'i').test(title)) return k;
+  }
+  return null;   // unknown — leave it off the order rather than guess
+}
+
 // ── Price one line (one product configuration × quantity) ─────────────────
 // All prices are computed here from Shopify data; the browser only sends
 // choices (product, purity, CT option index, quality, type, quantity).
@@ -284,8 +307,11 @@ async function priceLine(item, { token, goldRates, getMatrix }) {
   } = item;
   const engravingText = cleanText(item.engravingText);
 
-  if (!productId || !productTitle || !purityKt || !quality || !diamondType) {
-    throw new InputError('Missing required fields');
+  const missing = Object.entries({ productId, purityKt, quality, diamondType })
+    .filter(([, v]) => v === undefined || v === null || v === '')
+    .map(([k]) => k);
+  if (missing.length) {
+    throw new InputError('Missing required fields: ' + missing.join(', '));
   }
   if (!/^(gid:\/\/shopify\/Product\/)?\d+$/.test(String(productId))) {
     throw new InputError('Invalid product');
@@ -305,6 +331,16 @@ async function priceLine(item, { token, goldRates, getMatrix }) {
 
   const meta = await getProductMetafields(productId, token);
 
+  // Only sell a diamond type the product actually offers (same rule as the theme:
+  // lab is on unless show_lab_diamond = false; natural is off unless = true).
+  const flag = k => String(meta[k] ?? meta['custom.' + k] ?? '').toLowerCase();
+  if (diamondType === 'natural' && flag('show_natural_diamond') !== 'true') {
+    throw new InputError('Natural diamonds are not available for this product');
+  }
+  if (diamondType === 'lab' && flag('show_lab_diamond') === 'false') {
+    throw new InputError('Lab grown diamonds are not available for this product');
+  }
+
   // ── 18K gold weight for this CT option ──────────────────────────────────
   // Metafield: custom.gold_weight_18kt_options  (type: list.number_decimal)
   // Code derives: 24K = 18K ÷ 0.79, then 14K = 24K × 0.62, 9K = 24K × 0.40
@@ -322,6 +358,13 @@ async function priceLine(item, { token, goldRates, getMatrix }) {
   // Metafields: custom.solitaire_ct_options / custom.side_ct_options
   const solOptions  = parseList(meta.solitaire_ct_options || meta['custom.solitaire_ct_options']);
   const sideOptions = parseList(meta.side_ct_options      || meta['custom.side_ct_options']);
+  // The three lists are matched by position. If a list exists but has no entry
+  // for this option, the option is misconfigured — refuse instead of pricing it
+  // without those diamonds.
+  if ((solOptions.length && ctIdx >= solOptions.length) || (sideOptions.length && ctIdx >= sideOptions.length)) {
+    console.warn('Carat lists out of step', { productId, ctIdx, gold: goldWt18kOptions.length, sol: solOptions.length, side: sideOptions.length });
+    throw new InputError('This option is not available for this product');
+  }
   const solWtFloat  = parseFloat(solOptions[ctIdx])  || 0;
   const sideWtFloat = parseFloat(sideOptions[ctIdx]) || 0;
   if (solWtFloat <= 0 && sideWtFloat <= 0) {
@@ -349,6 +392,7 @@ async function priceLine(item, { token, goldRates, getMatrix }) {
     goldPrice, solPrice, sidePrice, making, unitPrice
   });
 
+  const shapeName        = resolveShape(shape, meta);
   const colorMatch       = (metalLabel || '').match(/Yellow|White|Rose/i);
   const colorName        = colorMatch ? colorMatch[0] : 'Yellow';
   const diamondTypeLabel = diamondType === 'lab' ? 'Lab Grown Diamond' : 'Natural Diamond';
@@ -365,7 +409,7 @@ async function priceLine(item, { token, goldRates, getMatrix }) {
     ...(sideWtFloat > 0 ? [{ key: 'Side Diamond Count',  value: sideCount + ' pcs' }] : []),
     ...(sideWtFloat > 0 ? [{ key: 'Side Diamond Weight', value: sideWtFloat + 'ct' }] : []),
     ...(ringSize      ? [{ key: 'Ring Size',      value: cleanText(ringSize) }] : []),
-    ...(shape         ? [{ key: 'Diamond Shape',  value: cleanText(shape)    }] : []),
+    ...(shapeName     ? [{ key: 'Diamond Shape',  value: shapeName           }] : []),
     ...(certType      ? [{ key: 'Certificate',    value: cleanText(certType) }] : []),
     ...(engravingText ? [{ key: 'Engraving Text', value: engravingText       }] : [])
   ];
@@ -382,7 +426,7 @@ async function priceLine(item, { token, goldRates, getMatrix }) {
       }
     : {
         // No variant found — fall back to a custom line item (no image).
-        title: cleanText(productTitle),
+        title: cleanText(meta.__title || productTitle || 'Orsia Jewellery'),
         quantity,
         originalUnitPriceWithCurrency: { amount: unitPrice.toFixed(2), currencyCode: CURRENCY_CODE },
         requiresShipping: true,
