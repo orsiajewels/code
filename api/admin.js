@@ -7,6 +7,7 @@
 // diamond price tables, and any gaps that would block an order.
 
 import crypto from 'node:crypto';
+import { sortedList } from '../lib/pricing.js';
 
 const API_VERSION = '2025-01';
 const MAX_LINK_AGE_SEC = 10 * 60;
@@ -138,10 +139,10 @@ function tableProblems(matrix) {
 function productProblems(products, matrices) {
   const rows = [];
   for (const p of products) {
-    const gold = parseList(p.m.gold_weight_18kt_options);
+    const gold = sortedList(p.m.gold_weight_18kt_options);
     if (!gold.length) continue;                    // not a calculator product
-    const sol = parseList(p.m.solitaire_ct_options);
-    const side = parseList(p.m.side_ct_options);
+    const sol = sortedList(p.m.solitaire_ct_options);     // same order the page shows
+    const side = sortedList(p.m.side_ct_options);
     const solCount = parseInt(p.m.solitaire_count || 0, 10);
     const sideCount = parseInt(p.m.side_count || 0, 10);
     const flag = k => String(p.m[k] ?? '').toLowerCase();
@@ -172,6 +173,15 @@ function productProblems(products, matrices) {
     }
   }
   return rows;
+}
+
+// Links to the product sync, signed the same way Shopify signs admin links,
+// so only someone already inside this admin page can open them.
+function signedSyncUrl(extra) {
+  const q = { shop: process.env.SHOPIFY_STORE, timestamp: String(Math.floor(Date.now() / 1000)), view: 'html', ...extra };
+  const msg = Object.keys(q).sort().map(k => `${k}=${q[k]}`).join('&');
+  q.hmac = crypto.createHmac('sha256', process.env.SHOPIFY_CLIENT_SECRET || '').update(msg).digest('hex');
+  return '/api/sync-products?' + new URLSearchParams(q).toString();
 }
 
 // ── HTML ────────────────────────────────────────────────────────────────────
@@ -207,7 +217,7 @@ ${clientId ? `<meta name="shopify-api-key" content="${esc(clientId)}"><script sr
 </style></head><body><main>${body}</main></body></html>`;
 }
 
-function render({ shop, rates, health, matrices, productRows, productCount, generatedAt }) {
+function render({ shop, rates, health, matrices, productRows, productCount, generatedAt, syncPreviewUrl, syncRunUrl }) {
   const hRow = (label, ok, note) =>
     `<tr><td>${esc(label)}</td><td><span class="pill ${ok ? 'ok' : 'bad'}">${ok ? 'OK' : 'Problem'}</span></td><td class="muted">${esc(note || '')}</td></tr>`;
 
@@ -268,6 +278,9 @@ function render({ shop, rates, health, matrices, productRows, productCount, gene
       ${hRow('Diamond price tables', health.tables, health.tablesNote)}
     </tbody></table></div></div>
     <div class="card"><h2>Today's gold rates</h2>${rateCard}</div>
+    <div class="card"><div class="row"><h2 style="margin:0">Daily product sync</h2>
+      <span><a href="${esc(syncPreviewUrl)}">Preview</a> · <a href="${esc(syncRunUrl)}">Run now</a></span></div>
+      <p class="muted" style="margin:8px 0 0">Every morning (6:00 IST) each made-to-order calculator product gets its variant price set to the page's default-selection price (for Google/Meta feeds and express checkout) and "continue selling when out of stock" switched on. Ready-stock items are never changed. Links are valid for 10 minutes — refresh this page for new ones.</p></div>
     ${productCard}
     ${matrixCards}`;
 }
@@ -327,5 +340,5 @@ export default async function handler(req, res) {
   }
 
   const generatedAt = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-  return res.status(200).send(page(render({ shop: (process.env.SHOPIFY_STORE_DOMAIN || store).replace(/^https?:\/\//, ''), rates, health, matrices, productRows, productCount, generatedAt }), clientId));
+  return res.status(200).send(page(render({ shop: (process.env.SHOPIFY_STORE_DOMAIN || store).replace(/^https?:\/\//, ''), syncPreviewUrl: signedSyncUrl({ dry: '1' }), syncRunUrl: signedSyncUrl({}), rates, health, matrices, productRows, productCount, generatedAt }), clientId));
 }

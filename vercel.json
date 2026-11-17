@@ -2,6 +2,18 @@
   "functions": {
     "api/create-order.js": {
       "maxDuration": 30
+    },
+    "api/sync-products.js": {
+      "maxDuration": 60
+    },
+    "api/admin.js": {
+      "maxDuration": 30
     }
-  }
+  },
+  "crons": [
+    {
+      "path": "/api/sync-products",
+      "schedule": "30 0 * * *"
+    }
+  ]
 }
